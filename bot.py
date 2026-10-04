@@ -9,6 +9,7 @@
 import os
 import re
 import time
+import unicodedata                         # 全角・半角をそろえるための部品
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
@@ -18,8 +19,8 @@ import requests  # Discordと通信するための部品
 # ------------------------------------------------------------
 # 設定(GitHubのSecretsから読み込まれる)
 # ------------------------------------------------------------
-TOKEN = os.environ["DISCORD_TOKEN"]                    # Botのトークン
-ADD_CHANNEL_ID = os.environ["ADD_CHANNEL_ID"].strip()  # #add のID
+TOKEN = os.environ["DISCORD_TOKEN"]                      # Botのトークン
+ADD_CHANNEL_ID = os.environ["ADD_CHANNEL_ID"].strip()    # #add のID
 TASK_CHANNEL_ID = os.environ["TASK_CHANNEL_ID"].strip()  # #task のID
 
 API = "https://discord.com/api/v10"
@@ -29,6 +30,10 @@ HEADERS = {
 }
 JST = ZoneInfo("Asia/Tokyo")  # 日本時間
 MAX_HISTORY = 1000            # #add から読み込む投稿の最大数
+WEEKDAYS = "月火水木金土日"    # 曜日の表示用(月曜=0)
+
+# 期限の行の先頭に使える「~」の種類(半角・全角・波ダッシュ)
+TILDES = ("~", "～", "〜", "∼")
 
 
 # ------------------------------------------------------------
@@ -67,12 +72,35 @@ def get_messages(channel_id, max_count):
 # ------------------------------------------------------------
 # メッセージの解析
 # ------------------------------------------------------------
-def parse_add(lines):
+def parse_due(text, ref):
+    """
+    期限の行から日付を取り出す。
+      2026/10/25(火) / 10/25 / 2026-10-25 などに対応
+    年がない場合は、基準日(ref=投稿した日)より前なら翌年にする
+    読み取れなければ None を返す
+    """
+    text = unicodedata.normalize("NFKC", text)   # 全角の数字や記号を半角にそろえる
+    m = re.search(r"(?:(\d{4})\s*[/.\-]\s*)?(\d{1,2})\s*[/.\-]\s*(\d{1,2})", text)
+    if not m:
+        return None
+    y, mo, d = m.groups()
+    try:
+        if y:                                    # 年が書いてある
+            return date(int(y), int(mo), int(d))
+        due = date(ref.year, int(mo), int(d))    # 年がない → 投稿した年とみなす
+        if due < ref:                            # すでに過ぎた日付なら翌年
+            due = date(ref.year + 1, int(mo), int(d))
+        return due
+    except ValueError:
+        return None                              # 2/31 のような存在しない日付
+
+
+def parse_add(lines, ref):
     """
     "ad" の投稿からタスクを取り出す。
       ad
       ■デモリール提出
-      ~2026/10/26
+      ~2026/10/25(火)
     ■ で始まる行 = タイトル、~ で始まる行 = 期限
     """
     added = []
@@ -85,15 +113,11 @@ def parse_add(lines):
             if current:
                 added.append(current)
             current = {"title": line[1:].strip(), "due": None}
-        elif line.startswith("~") or line.startswith("～"):  # 期限
+        elif unicodedata.normalize("NFKC", line).startswith(("~", "〜", "∼")):  # 期限
             if current:
-                m = re.search(r"(\d{4})/(\d{1,2})/(\d{1,2})", line)
-                if m:
-                    y, mo, d = map(int, m.groups())
-                    try:
-                        current["due"] = date(y, mo, d).isoformat()
-                    except ValueError:
-                        pass         # 存在しない日付は無視
+                due = parse_due(line, ref)
+                if due:
+                    current["due"] = due.isoformat()
     if current:
         added.append(current)
     return added
@@ -107,6 +131,22 @@ def parse_finish(lines):
         if t:
             titles.append(t)
     return titles
+
+
+# ------------------------------------------------------------
+# 期限の近さに応じたマーク
+# ------------------------------------------------------------
+def deadline_label(diff):
+    """期限まであと diff 日 → (マーク, 説明文) を返す"""
+    if diff < 0:
+        return "🚨", f"{abs(diff)}日超過"
+    if diff == 0:
+        return "🔥", "今日まで"
+    if diff <= 3:
+        return "⚠️", f"あと{diff}日"
+    if diff <= 7:
+        return "🟡", f"あと{diff}日"
+    return "", f"あと{diff}日"      # 8日以上先はマークなし
 
 
 # ------------------------------------------------------------
@@ -124,14 +164,13 @@ def build_chunks(tasks):
     for t in tasks:
         if t["due"]:
             d = date.fromisoformat(t["due"])
-            diff = (d - today).days   # 期限まであと何日か
-            if diff < 0:
-                tag = f"⚠️ {abs(diff)}日超過"
-            elif diff == 0:
-                tag = "🔥 今日まで"
-            else:
-                tag = f"あと{diff}日"
-            entries.append(f"■ **{t['title']}**\n　~{d.strftime('%Y/%m/%d')}({tag})")
+            mark, text = deadline_label((d - today).days)
+            wd = WEEKDAYS[d.weekday()]                       # 正しい曜日を自動計算
+            head = f"{mark} " if mark else ""
+            entries.append(
+                f"{head}■ **{t['title']}**\n"
+                f"　~{d.strftime('%Y/%m/%d')}({wd}) {text}"
+            )
         else:
             entries.append(f"■ **{t['title']}**\n　期限なし")
 
@@ -165,7 +204,9 @@ def main():
         command = lines[0].strip().lower()
 
         if command == "ad":
-            new = parse_add(lines)
+            # 投稿した日(日本時間)。年を省略した期限の判定に使う
+            posted = datetime.fromisoformat(m["timestamp"]).astimezone(JST).date()
+            new = parse_add(lines, posted)
             tasks.extend(new)
             results[m["id"]] = bool(new)
         elif command == "fn":
