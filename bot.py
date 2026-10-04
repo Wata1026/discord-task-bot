@@ -1,57 +1,67 @@
 # ============================================================
-# Discord タスク管理Bot
-#  #add チャンネルに "ad" または "fn" を書き込むと、
-#  #task チャンネルのタスク一覧が自動で更新されます
+# Discord タスク管理Bot(GitHub Actions版)
+#  5分ごとに1回だけ実行され、以下を行って終了します
+#   1. #add の投稿を古い順に読み、ad / fn を再現してタスク一覧を作る
+#   2. #task の内容と違っていれば、古い投稿を消して新しく投稿する
+#   3. 未処理の #add の投稿に ✅(成功) / ❓(失敗) を付ける
 # ============================================================
 
-import os                                  # 環境変数(トークン等)を読むための部品
-import json                                # タスクをファイルに保存するための部品
-import re                                  # 日付を文字から探すための部品
-from datetime import datetime, date        # 日付を扱うための部品
-from zoneinfo import ZoneInfo              # 日本時間を使うための部品
+import os
+import re
+import time
+from datetime import datetime, date
+from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
-import discord                             # Discordを操作する部品
-from dotenv import load_dotenv             # .envファイルを読む部品(自分のPCで動かす時用)
+import requests  # Discordと通信するための部品
 
 # ------------------------------------------------------------
-# 設定の読み込み
+# 設定(GitHubのSecretsから読み込まれる)
 # ------------------------------------------------------------
-load_dotenv()  # .envファイルがあれば中身を読み込む(なければ何もしない)
+TOKEN = os.environ["DISCORD_TOKEN"]                    # Botのトークン
+ADD_CHANNEL_ID = os.environ["ADD_CHANNEL_ID"].strip()  # #add のID
+TASK_CHANNEL_ID = os.environ["TASK_CHANNEL_ID"].strip()  # #task のID
 
-TOKEN = os.getenv("DISCORD_TOKEN")                    # Botのトークン(パスワード)
-ADD_CHANNEL_ID = int(os.getenv("ADD_CHANNEL_ID"))     # #add チャンネルのID
-TASK_CHANNEL_ID = int(os.getenv("TASK_CHANNEL_ID"))   # #task チャンネルのID
-
-# タスクの保存先。DATA_DIRが設定されていればそのフォルダ、なければ今のフォルダ
-DATA_DIR = os.getenv("DATA_DIR", ".")
-DATA_FILE = os.path.join(DATA_DIR, "tasks.json")      # タスクを保存するファイル名
-
+API = "https://discord.com/api/v10"
+HEADERS = {
+    "Authorization": f"Bot {TOKEN}",
+    "User-Agent": "DiscordBot (task-bot, 1.0)",
+}
 JST = ZoneInfo("Asia/Tokyo")  # 日本時間
-
-# ------------------------------------------------------------
-# Botの基本設定
-# ------------------------------------------------------------
-intents = discord.Intents.default()
-intents.message_content = True            # メッセージの中身を読む許可
-client = discord.Client(intents=intents)  # Bot本体を作成
+MAX_HISTORY = 1000            # #add から読み込む投稿の最大数
 
 
 # ------------------------------------------------------------
-# タスクの保存・読み込み
+# Discordとの通信
 # ------------------------------------------------------------
-def load_tasks():
-    """tasks.json からタスク一覧を読み込む(ファイルがなければ空のリスト)"""
-    if not os.path.exists(DATA_FILE):
-        return []
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+def call(method, path, **kwargs):
+    """Discord APIを呼ぶ。「回数制限」と言われたら待って再試行する"""
+    while True:
+        r = requests.request(method, API + path, headers=HEADERS, timeout=30, **kwargs)
+        if r.status_code == 429:  # 送りすぎ → 指定された秒数待つ
+            time.sleep(r.json().get("retry_after", 1) + 0.5)
+            continue
+        return r
 
 
-def save_tasks(tasks):
-    """タスク一覧を tasks.json に保存する"""
-    os.makedirs(DATA_DIR, exist_ok=True)  # 保存フォルダがなければ作る
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(tasks, f, ensure_ascii=False, indent=2)
+def get_messages(channel_id, max_count):
+    """チャンネルの投稿を新しい順に最大max_count件取得する"""
+    msgs = []
+    before = None
+    while len(msgs) < max_count:
+        params = {"limit": 100}
+        if before:
+            params["before"] = before
+        r = call("GET", f"/channels/{channel_id}/messages", params=params)
+        r.raise_for_status()
+        batch = r.json()
+        if not batch:
+            break
+        msgs += batch
+        before = batch[-1]["id"]  # 次はこのIDより古いものを取る
+        if len(batch) < 100:
+            break
+    return msgs
 
 
 # ------------------------------------------------------------
@@ -59,73 +69,59 @@ def save_tasks(tasks):
 # ------------------------------------------------------------
 def parse_add(lines):
     """
-    "ad" の書き込みからタスクを取り出す。
-    例)
+    "ad" の投稿からタスクを取り出す。
       ad
       ■デモリール提出
       ~2026/10/26
     ■ で始まる行 = タイトル、~ で始まる行 = 期限
-    1つのメッセージに複数タスクを書いてもOK
     """
-    added = []       # 取り出したタスクを入れる箱
-    current = None   # いま処理中のタスク
-
-    for line in lines[1:]:          # 1行目("ad")は飛ばして2行目から見る
-        line = line.strip()         # 前後の空白を除去
-        if not line:                # 空行は無視
+    added = []
+    current = None
+    for line in lines[1:]:           # 1行目("ad")は飛ばす
+        line = line.strip()
+        if not line:
             continue
-
-        if line.startswith("■"):    # ■ で始まる = 新しいタスクのタイトル
-            if current:             # 前のタスクがあれば箱に入れる
+        if line.startswith("■"):     # 新しいタスク
+            if current:
                 added.append(current)
             current = {"title": line[1:].strip(), "due": None}
-
-        elif line.startswith("~") or line.startswith("～"):  # ~ で始まる = 期限
+        elif line.startswith("~") or line.startswith("～"):  # 期限
             if current:
-                # 「2026/10/26」のような形を探す
                 m = re.search(r"(\d{4})/(\d{1,2})/(\d{1,2})", line)
                 if m:
                     y, mo, d = map(int, m.groups())
                     try:
                         current["due"] = date(y, mo, d).isoformat()
                     except ValueError:
-                        pass        # 2026/02/31 のような存在しない日付は無視
-
-    if current:                     # 最後のタスクも箱に入れる
+                        pass         # 存在しない日付は無視
+    if current:
         added.append(current)
     return added
 
 
 def parse_finish(lines):
-    """
-    "fn" の書き込みから、完了したタスクのタイトルを取り出す。
-    例)
-      fn
-      デモリール提出
-    複数行書けば複数まとめて完了にできる
-    """
+    """"fn" の投稿から、完了したタスクのタイトルを取り出す"""
     titles = []
     for line in lines[1:]:
-        t = line.strip().lstrip("■").strip()  # 前後の空白と先頭の■を除去
+        t = line.strip().lstrip("■").strip()
         if t:
             titles.append(t)
     return titles
 
 
 # ------------------------------------------------------------
-# #task に表示する一覧メッセージを作る
+# #task に投稿する一覧を作る(2000文字を超える場合は分割)
 # ------------------------------------------------------------
-def build_task_message(tasks):
+def build_chunks(tasks):
     if not tasks:
-        return "📋 **タスク一覧**\n\n現在のタスクはありません 🎉"
+        return ["📋 **タスク一覧**\n\n現在のタスクはありません 🎉"]
 
-    # 期限が近い順に並び替え(期限なしは一番後ろ)
-    sorted_tasks = sorted(tasks, key=lambda t: (t["due"] is None, t["due"] or ""))
+    # 期限が近い順に並び替え(期限なしは最後)
+    tasks = sorted(tasks, key=lambda t: (t["due"] is None, t["due"] or ""))
+    today = datetime.now(JST).date()
 
-    today = datetime.now(JST).date()  # 今日の日付(日本時間)
-    out = ["📋 **タスク一覧**\n"]
-
-    for t in sorted_tasks:
+    entries = []
+    for t in tasks:
         if t["due"]:
             d = date.fromisoformat(t["due"])
             diff = (d - today).days   # 期限まであと何日か
@@ -135,77 +131,80 @@ def build_task_message(tasks):
                 tag = "🔥 今日まで"
             else:
                 tag = f"あと{diff}日"
-            out.append(f"■ **{t['title']}**\n　~{d.strftime('%Y/%m/%d')}({tag})")
+            entries.append(f"■ **{t['title']}**\n　~{d.strftime('%Y/%m/%d')}({tag})")
         else:
-            out.append(f"■ **{t['title']}**\n　期限なし")
+            entries.append(f"■ **{t['title']}**\n　期限なし")
 
-    out.append(f"\n_最終更新: {datetime.now(JST).strftime('%Y/%m/%d %H:%M')}_")
-    return "\n".join(out)
+    # Discordは1投稿2000文字までなので、1800文字ごとに分ける
+    chunks = []
+    current = "📋 **タスク一覧**\n"
+    for e in entries:
+        if len(current) + len(e) + 1 > 1800:
+            chunks.append(current)
+            current = ""
+        current += "\n" + e
+    chunks.append(current)
+    return chunks
 
 
-async def refresh_task_channel():
-    """#task の古いBotメッセージを消して、最新の一覧を投稿し直す"""
-    channel = client.get_channel(TASK_CHANNEL_ID)
-    if channel is None:   # チャンネルが見つからなければ何もしない
+# ------------------------------------------------------------
+# メイン処理
+# ------------------------------------------------------------
+def main():
+    me = call("GET", "/users/@me").json()["id"]  # Bot自身のID
+
+    # ---- #add の投稿を古い順に並べて、adとfnを順番に再現 ----
+    add_msgs = list(reversed(get_messages(ADD_CHANNEL_ID, MAX_HISTORY)))
+    tasks = []
+    results = {}  # 投稿ID → 成功したか
+
+    for m in add_msgs:
+        if m["author"].get("bot"):   # Botの投稿は無視
+            continue
+        lines = m["content"].strip().split("\n")
+        command = lines[0].strip().lower()
+
+        if command == "ad":
+            new = parse_add(lines)
+            tasks.extend(new)
+            results[m["id"]] = bool(new)
+        elif command == "fn":
+            titles = parse_finish(lines)
+            before = len(tasks)
+            tasks = [t for t in tasks if t["title"] not in titles]
+            results[m["id"]] = len(tasks) < before
+
+    print(f"現在のタスク数: {len(tasks)}")
+
+    # ---- まだ反応が付いていない投稿に ✅ / ❓ を付ける ----
+    for m in add_msgs:
+        if m["id"] not in results:
+            continue
+        if any(r.get("me") for r in m.get("reactions", [])):
+            continue                 # すでにBotが反応済み
+        emoji = "✅" if results[m["id"]] else "❓"
+        r = call("PUT", f"/channels/{ADD_CHANNEL_ID}/messages/{m['id']}"
+                        f"/reactions/{quote(emoji)}/@me")
+        if r.status_code == 403:     # リアクション権限がない → 諦める(続行はする)
+            print("リアクション権限がありません(一覧更新は続行します)")
+            break
+
+    # ---- #task を更新 ----
+    chunks = build_chunks(tasks)
+    task_msgs = list(reversed(get_messages(TASK_CHANNEL_ID, 50)))
+    mine = [m for m in task_msgs if m["author"]["id"] == me]  # Bot自身の投稿
+
+    # すでに同じ内容なら何もしない(無駄な削除・再投稿を避ける)
+    if [m["content"] for m in mine] == chunks:
+        print("変更なし")
         return
 
-    # 直近50件のうち、Bot自身が書いたメッセージを削除
-    async for msg in channel.history(limit=50):
-        if msg.author == client.user:
-            await msg.delete()
-
-    # 最新の一覧を投稿
-    await channel.send(build_task_message(load_tasks()))
-
-
-# ------------------------------------------------------------
-# Discordからのイベント処理
-# ------------------------------------------------------------
-@client.event
-async def on_ready():
-    """Botが起動してログインできた時に1回だけ実行される"""
-    print(f"ログイン成功: {client.user}")
-    await refresh_task_channel()  # 起動時にも一覧を最新にする
+    for m in mine:  # 古い投稿を削除
+        call("DELETE", f"/channels/{TASK_CHANNEL_ID}/messages/{m['id']}")
+    for c in chunks:  # 新しい一覧を投稿
+        r = call("POST", f"/channels/{TASK_CHANNEL_ID}/messages", json={"content": c})
+        r.raise_for_status()
+    print("#task を更新しました")
 
 
-@client.event
-async def on_message(message):
-    """メッセージが投稿されるたびに実行される"""
-
-    # Bot自身の投稿、または #add 以外のチャンネルの投稿は無視
-    if message.author.bot or message.channel.id != ADD_CHANNEL_ID:
-        return
-
-    lines = message.content.strip().split("\n")  # 行ごとに分割
-    command = lines[0].strip().lower()           # 1行目(ad か fn か)
-    tasks = load_tasks()                         # 現在のタスクを読み込み
-
-    # ----- タスク追加 -----
-    if command == "ad":
-        new_tasks = parse_add(lines)
-        if not new_tasks:                        # 読み取れなかった場合
-            await message.add_reaction("❓")
-            return
-        tasks.extend(new_tasks)                  # タスクを追加
-        save_tasks(tasks)                        # 保存
-        await refresh_task_channel()             # #task を更新
-        await message.add_reaction("✅")         # 成功の印
-
-    # ----- タスク完了 -----
-    elif command == "fn":
-        titles = parse_finish(lines)
-        before = len(tasks)
-        # 完了タイトルと一致しないものだけ残す(=一致したものを削除)
-        tasks = [t for t in tasks if t["title"] not in titles]
-        if len(tasks) == before:                 # 1件も一致しなかった場合
-            await message.add_reaction("❓")
-            return
-        save_tasks(tasks)
-        await refresh_task_channel()
-        await message.add_reaction("✅")
-
-
-# ------------------------------------------------------------
-# Botを起動
-# ------------------------------------------------------------
-client.run(TOKEN)
+main()
