@@ -1,0 +1,26 @@
+# 5分ごとに bot.py を1回実行する設定
+name: Update tasks
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # 5分ごと(10分ごとにしたい場合は */10 に変更)
+  workflow_dispatch:         # 手動実行ボタンも使えるようにする
+
+concurrency:
+  group: task-update         # 同時に2つ動かさない
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4          # リポジトリのコードを取得
+      - uses: actions/setup-python@v5      # Pythonを用意
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt   # 部品をインストール
+      - run: python bot.py                     # Botを実行
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          ADD_CHANNEL_ID: ${{ secrets.ADD_CHANNEL_ID }}
+          TASK_CHANNEL_ID: ${{ secrets.TASK_CHANNEL_ID }}
